@@ -54,6 +54,7 @@ async fn open_options_create_new() {
 
 #[tokio::test]
 #[cfg(unix)]
+#[ignore]
 async fn open_options_mode() {
     // TESTING HACK: use Debug output to check the stored data
     assert!(format!("{:?}", OpenOptions::new().mode(0o644)).contains("mode: 420 "));

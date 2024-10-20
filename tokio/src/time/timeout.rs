@@ -5,8 +5,8 @@
 //! [`Timeout`]: struct@Timeout
 
 use crate::{
-    runtime::coop,
-    time::{error::Elapsed, sleep_until, Duration, Instant, Sleep},
+    runtime::{coop, scheduler},
+    time::{error::Elapsed, Duration, Instant, Sleep},
     util::trace,
 };
 
@@ -87,14 +87,14 @@ pub fn timeout<F>(duration: Duration, future: F) -> Timeout<F>
 where
     F: Future,
 {
-    let location = trace::caller_location();
+    // Ensure that the current task is running in the context of a Tokio runtime
+    // and that timers are enabled.
+    let handle = scheduler::Handle::current();
+    let _ = handle.driver().time();
 
+    let location = trace::caller_location();
     let deadline = Instant::now().checked_add(duration);
-    let delay = match deadline {
-        Some(deadline) => Sleep::new_timeout(deadline, location),
-        None => Sleep::far_future(location),
-    };
-    Timeout::new_with_delay(future, delay)
+    Timeout::new_with_deadline(future, deadline, location)
 }
 
 /// Requires a `Future` to complete before the specified instant in time.
@@ -146,11 +146,9 @@ pub fn timeout_at<F>(deadline: Instant, future: F) -> Timeout<F>
 where
     F: Future,
 {
-    let delay = sleep_until(deadline);
-
     Timeout {
         value: future,
-        delay,
+        delay: Delay::Deadline(Some(deadline), trace::caller_location()),
     }
 }
 
@@ -162,13 +160,20 @@ pin_project! {
         #[pin]
         value: T,
         #[pin]
-        delay: Sleep,
+        delay: Delay,
     }
 }
 
 impl<T> Timeout<T> {
-    pub(crate) fn new_with_delay(value: T, delay: Sleep) -> Timeout<T> {
-        Timeout { value, delay }
+    pub(crate) fn new_with_deadline(
+        value: T,
+        deadline: Option<Instant>,
+        location: Option<&'static core::panic::Location<'static>>,
+    ) -> Timeout<T> {
+        Timeout {
+            value,
+            delay: Delay::Deadline(deadline, location),
+        }
     }
 
     /// Gets a reference to the underlying value in this timeout.
@@ -194,7 +199,7 @@ where
     type Output = Result<T::Output, Elapsed>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Self::Output> {
-        let me = self.project();
+        let mut me = self.project();
 
         let had_budget_before = coop::has_budget_remaining();
 
@@ -205,9 +210,27 @@ where
 
         let has_budget_now = coop::has_budget_remaining();
 
-        let delay = me.delay;
+        // The future wasn't ready on the first poll, so we must create a Sleep future now. We avoid
+        // creating it if the future was ready on the first poll to avoid creating and dropping a
+        // TimerEntry, which requires acquiring the driver lock.
+        if let Delay::Deadline(deadline, location) =
+            unsafe { me.delay.as_mut().get_unchecked_mut() }
+        {
+            let sleep = match deadline.take() {
+                Some(deadline) => Sleep::new_timeout(deadline, location.take()),
+                None => Sleep::far_future(location.take()),
+            };
+            me.delay.set(Delay::Sleep(sleep));
+        }
 
+        let delay = me.delay;
         let poll_delay = || -> Poll<Self::Output> {
+            let delay = unsafe {
+                delay.map_unchecked_mut(|delay| match delay {
+                    Delay::Sleep(sleep) => sleep,
+                    _ => unreachable!(),
+                })
+            };
             match delay.poll(cx) {
                 Poll::Ready(()) => Poll::Ready(Err(Elapsed::new())),
                 Poll::Pending => Poll::Pending,
@@ -225,4 +248,13 @@ where
             poll_delay()
         }
     }
+}
+
+#[derive(Debug)]
+enum Delay {
+    Deadline(
+        Option<Instant>,
+        Option<&'static core::panic::Location<'static>>,
+    ),
+    Sleep(Sleep),
 }
